@@ -1,9 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { _testing } from "../extensions/rust-guardian.ts";
+import { dirname, join } from "node:path";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import rustGuardian, { _testing } from "../extensions/rust-guardian.ts";
 
 const {
   detectRustEdition,
@@ -12,6 +14,11 @@ const {
   matchesFormattedHash,
   recordFormattedHash,
   isBoilerplateCargoStderrLine,
+  isCargoWarningLine,
+  isFullFileRead,
+  shouldHintReformat,
+  getRuntimeState,
+  getSessionState,
   normalizePath,
 } = _testing;
 
@@ -187,5 +194,266 @@ describe("normalizePath", () => {
     const cwd = tmpdir();
     const normalized = normalizePath(cwd, "@src/main.rs");
     assert.ok(normalized.endsWith("src/main.rs"));
+  });
+});
+
+describe("pi-tui visibleWidth / truncateToWidth (CJK & emoji)", () => {
+  it("measures wide CJK characters as double-width", () => {
+    assert.equal(visibleWidth("日本語"), 6);
+    assert.equal(visibleWidth("a日本b"), 6);
+  });
+
+  it("measures emojis as double-width columns", () => {
+    const emojiStr = "a\u{1F680}b"; // a + rocket + b (4 code units, 4 columns)
+    assert.equal(visibleWidth(emojiStr), 4);
+    assert.ok(visibleWidth(emojiStr) > [...emojiStr].length); // > code points
+  });
+
+  it("truncates to width without exceeding the allotted width", () => {
+    const truncated = truncateToWidth("hello 日本語 world", 10);
+    assert.ok(visibleWidth(truncated) <= 10);
+    const emojiTruncated = truncateToWidth("\u{1F680}\u{1F680}\u{1F680}abc", 5);
+    assert.ok(visibleWidth(emojiTruncated) <= 5);
+  });
+});
+
+describe("shouldHintReformat", () => {
+  it("returns false when snap matches disk hash and formattedSinceRead is false, even if hash is a known formatted output", () => {
+    const formattedHashes = new Map<string, string>([["h1", "h2"]]);
+    const snapEntry = { hash: "h2", full: true, formattedSinceRead: false };
+    assert.equal(shouldHintReformat(snapEntry, "h2", formattedHashes), false);
+  });
+
+  it("returns true when snap matches disk hash and formattedSinceRead is true", () => {
+    const snapEntry = { hash: "h2", full: true, formattedSinceRead: true };
+    assert.equal(
+      shouldHintReformat(snapEntry, "h2", new Map()),
+      true
+    );
+  });
+
+  it("falls back to known-formatted-output check when snapEntry is missing or stale", () => {
+    const formattedHashes = new Map<string, string>([["h1", "h2"]]);
+    assert.equal(shouldHintReformat(undefined, "h2", formattedHashes), true);
+    assert.equal(
+      shouldHintReformat(
+        { hash: "h0", full: true, formattedSinceRead: false },
+        "h2",
+        formattedHashes
+      ),
+      true
+    );
+    assert.equal(shouldHintReformat(undefined, "h9", formattedHashes), false);
+  });
+});
+
+describe("isFullFileRead", () => {
+  const makeFile = () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rg-full-read-"));
+    const filePath = join(tempDir, "small.rs");
+    writeFileSync(
+      filePath,
+      Array.from({ length: 20 }, (_, i) => `let x${i} = ${i};`).join("\n")
+    );
+    return filePath;
+  };
+
+  it("treats offset:1 with a limit covering the whole file as a full read", () => {
+    const filePath = makeFile();
+    assert.equal(isFullFileRead(filePath, 1, 100, false), true);
+    rmSync(dirname(filePath), { recursive: true, force: true });
+  });
+
+  it("treats a limit smaller than the file as partial", () => {
+    const filePath = makeFile();
+    assert.equal(isFullFileRead(filePath, undefined, 5, false), false);
+    rmSync(dirname(filePath), { recursive: true, force: true });
+  });
+
+  it("treats offset > 1 as partial", () => {
+    const filePath = makeFile();
+    assert.equal(isFullFileRead(filePath, 2, undefined, false), false);
+    rmSync(dirname(filePath), { recursive: true, force: true });
+  });
+
+  it("treats truncated reads as partial", () => {
+    const filePath = makeFile();
+    assert.equal(isFullFileRead(filePath, undefined, undefined, true), false);
+    rmSync(dirname(filePath), { recursive: true, force: true });
+  });
+
+  it("treats an unbounded, untruncated read as full", () => {
+    const filePath = makeFile();
+    assert.equal(isFullFileRead(filePath, undefined, undefined, false), true);
+    rmSync(dirname(filePath), { recursive: true, force: true });
+  });
+});
+
+describe("extractCargoErrors warning filtering", () => {
+  it("excludes cargo stderr warning lines when compiler errors exist", () => {
+    const stdout = JSON.stringify({
+      reason: "compiler-message",
+      message: {
+        level: "error",
+        message: "mismatched types",
+        rendered: "error[E0308]: mismatched types\n --> src/main.rs:5:12",
+        spans: [{ file_name: "src/main.rs" }],
+      },
+    });
+
+    const stderr = [
+      "warning: profiles for the non root package will be ignored",
+      "warning: unused manifest key: workspace.foo",
+      "error: could not compile `my-crate` due to 1 previous error",
+    ].join("\n");
+
+    const errors = extractCargoErrors(stdout, stderr);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /mismatched types/);
+    assert.ok(errors.every((e) => !isCargoWarningLine(e)));
+  });
+
+  it("returns only non-boilerplate panic lines when stdout has no errors", () => {
+    const stderr = [
+      "warning: build failed, waiting for other jobs to finish...",
+      "thread 'main' panicked at build.rs:3:1: build script panicked",
+      "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+    ].join("\n");
+
+    const errors = extractCargoErrors("", stderr);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /panicked/);
+    assert.ok(!errors[0].includes("build failed, waiting"));
+  });
+});
+
+describe("detectRustEdition section-aware parsing", () => {
+  it("prefers [workspace.package] edition over [package] edition in mixed root manifests", () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "rg-mixed-"));
+    const memberDir = join(rootDir, "crates", "member");
+    try {
+      mkdirSync(memberDir, { recursive: true });
+      writeFileSync(
+        join(rootDir, "Cargo.toml"),
+        ["[package]", 'name = "root"', 'version = "0.1.0"', 'edition = "2018"', "", "[workspace.package]", 'edition = "2024"', "", "[workspace]", 'members = ["crates/*"]'].join("\n")
+      );
+      writeFileSync(
+        join(memberDir, "Cargo.toml"),
+        '[package]\nname = "member"\nedition.workspace = true\n'
+      );
+      assert.equal(detectRustEdition(memberDir), "2024");
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("session isolation for editedThisTurn", () => {
+  it("returns independent editedThisTurn sets per session key", () => {
+    const runtime = getRuntimeState();
+    const mkCtx = (id: string) =>
+      ({
+        cwd: tmpdir(),
+        hasUI: false,
+        sessionManager: { getSessionId: () => id },
+      }) as any;
+
+    const a = getSessionState(runtime, mkCtx(`iso-a-${Date.now()}`));
+    const b = getSessionState(runtime, mkCtx(`iso-b-${Date.now()}`));
+    a.editedThisTurn.add("/tmp/a.rs");
+    assert.notEqual(a.editedThisTurn, b.editedThisTurn);
+    assert.equal(b.editedThisTurn.size, 0);
+  });
+});
+
+describe("syncFromBranch replay preserves formattedSinceRead", () => {
+  it("retains formattedSinceRead: true from edit toolResult details during replay", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rg-replay-"));
+    const srcDir = join(tempDir, "src");
+    const filePath = join(srcDir, "lib.rs");
+    try {
+      mkdirSync(srcDir, { recursive: true });
+      const fileContent = "pub fn f() -> u32 { 1 }\n";
+      writeFileSync(filePath, fileContent);
+      const h3 = createHash("sha256")
+        .update(fileContent)
+        .digest("hex");
+
+      const handlers: Record<string, ((...args: any[]) => any)[]> = {};
+      const mockPi = {
+        registerCommand: () => {},
+        on: (name: string, cb: (...args: any[]) => any) => {
+          handlers[name] = [cb];
+        },
+        appendEntry: () => {},
+      } as any;
+      rustGuardian(mockPi);
+
+      const sessionId = `replay-${Date.now()}`;
+      const ctx = {
+        cwd: tempDir,
+        hasUI: false,
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getBranch: () => [
+            {
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "toolCall",
+                    id: "c1",
+                    name: "read",
+                    arguments: { path: "src/lib.rs" },
+                  },
+                ],
+              },
+            },
+            {
+              message: {
+                role: "toolResult",
+                toolCallId: "c1",
+                isError: false,
+                details: { rustGuardian: { hash: "h1", full: true } },
+              },
+            },
+            {
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "toolCall",
+                    id: "c2",
+                    name: "edit",
+                    arguments: { path: "src/lib.rs" },
+                  },
+                ],
+              },
+            },
+            {
+              message: {
+                role: "toolResult",
+                toolCallId: "c2",
+                isError: false,
+                details: {
+                  rustGuardian: { hash: h3, full: true, formattedSinceRead: true },
+                },
+              },
+            },
+          ],
+        },
+      } as any;
+
+      await handlers.session_start[0]({}, ctx);
+
+      const session = getSessionState(getRuntimeState(), ctx);
+      const snap = session.readSnapshots.get(normalizePath(tempDir, "src/lib.rs"));
+      assert.ok(snap, "expected the replayed file to be tracked");
+      assert.equal(snap!.hash, h3);
+      assert.equal(snap!.full, true);
+      assert.equal(snap!.formattedSinceRead, true);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

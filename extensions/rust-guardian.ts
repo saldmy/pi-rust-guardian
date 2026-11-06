@@ -4,6 +4,7 @@ import {
   type ExtensionContext,
   isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -20,12 +21,6 @@ const DEFAULT_CARGO_TIMEOUT_MS = 60_000;
 const MAX_FORMATTED_HASH_ENTRIES = 4096;
 const FMT_CUSTOM_ENTRY_TYPE = "rust-guardian:fmt";
 const STATUS_KEY = "rust-guardian";
-
-// Strip ANSI escape codes to measure visible terminal column width
-const ANSI_REGEX = /\x1b\[[0-9;]*m/g;
-function visibleWidth(str: string): number {
-  return str.replace(ANSI_REGEX, "").length;
-}
 
 function getCargoTimeoutMs(): number {
   const raw = process.env.PI_RUST_GUARDIAN_CARGO_TIMEOUT_MS;
@@ -45,11 +40,13 @@ interface SnapshotEntry {
 interface GuardianToolDetails {
   hash: string;
   full: boolean;
+  formattedSinceRead?: boolean;
 }
 
 interface SessionGuardianState {
   readSnapshots: Map<string, SnapshotEntry>;
   invalidatedPaths: Set<string>;
+  editedThisTurn: Set<string>;
   lastCheckSummary?: string;
 }
 
@@ -107,15 +104,17 @@ function installPathLineFooterPatch(): void {
 
     if (Array.isArray(lines) && lines.length > 0) {
       const cleanRg = rgText.replace(/[\r\n\t]+/g, " ").trim();
-      const combined = `${lines[0]}  •  ${cleanRg}`;
+      const sep = "  •  ";
+      const combined = `${lines[0]}${sep}${cleanRg}`;
       if (visibleWidth(combined) <= width) {
         lines[0] = combined;
       } else {
-        // If terminal width is narrow, right-trim plain text to fit width
-        const available = Math.max(0, width - visibleWidth(lines[0]) - 5);
+        const available = width - visibleWidth(lines[0]) - visibleWidth(sep);
         if (available > 10) {
-          const strippedRg = cleanRg.replace(ANSI_REGEX, "");
-          lines[0] = `${lines[0]}  •  ${strippedRg.slice(0, available - 1)}…`;
+          lines[0] = truncateToWidth(
+            `${lines[0]}${sep}${truncateToWidth(cleanRg, available)}`,
+            width
+          );
         }
       }
     }
@@ -146,6 +145,7 @@ function getRuntimeState(): GuardianRuntimeState {
           existing.invalidatedPaths instanceof Set
             ? existing.invalidatedPaths
             : new Set<string>(),
+        editedThisTurn: new Set<string>(),
       });
     }
     existing.sessions = sessions;
@@ -198,6 +198,7 @@ function getSessionState(
     session = {
       readSnapshots: new Map<string, SnapshotEntry>(),
       invalidatedPaths: new Set<string>(),
+      editedThisTurn: new Set<string>(),
     };
     runtime.sessions.set(key, session);
   }
@@ -271,6 +272,20 @@ function isKnownFormattedOutputHash(
   return false;
 }
 
+function shouldHintReformat(
+  snapEntry: SnapshotEntry | undefined,
+  currentDiskHash: string | null,
+  formattedHashes: Map<string, string>
+): boolean {
+  if (snapEntry !== undefined && snapEntry.hash === currentDiskHash) {
+    return Boolean(snapEntry.formattedSinceRead);
+  }
+  return (
+    currentDiskHash !== null &&
+    isKnownFormattedOutputHash(formattedHashes, currentDiskHash)
+  );
+}
+
 function canonicalizePath(absPath: string): string {
   const realpath = realpathSync.native ?? realpathSync;
   let cur = absPath;
@@ -334,6 +349,26 @@ function parseTimestampMs(value: unknown): number | null {
   return null;
 }
 
+function isFullFileRead(
+  absPath: string,
+  offset: unknown,
+  limit: unknown,
+  wasTruncated: boolean
+): boolean {
+  if (wasTruncated) return false;
+  if (typeof offset === "number" && offset > 1) return false;
+  if (typeof limit === "number") {
+    try {
+      const content = readFileSync(absPath, "utf8");
+      const lineCount = content.split("\n").length;
+      return limit >= lineCount;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 function findCargoRoot(filePath: string): string | null {
   let dir = dirname(filePath);
   while (true) {
@@ -344,6 +379,18 @@ function findCargoRoot(filePath: string): string | null {
   }
 }
 
+function parseSectionEdition(
+  toml: string,
+  sectionHeader: string
+): string | null {
+  const escaped = sectionHeader.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp(`\\[${escaped}\\]([^\\[]*)`, "m");
+  const match = toml.match(regex);
+  if (!match?.[1]) return null;
+  const editionMatch = match[1].match(/^\s*edition\s*=\s*["'](\d{4})["']/m);
+  return editionMatch?.[1] ?? null;
+}
+
 function detectRustEdition(cargoRoot: string | null): string {
   if (!cargoRoot) return "2021";
   let dir: string | null = cargoRoot;
@@ -352,8 +399,14 @@ function detectRustEdition(cargoRoot: string | null): string {
     if (existsSync(manifestPath)) {
       try {
         const toml = readFileSync(manifestPath, "utf8");
-        const match = toml.match(/^\s*edition\s*=\s*["'](\d{4})["']/m);
-        if (match?.[1]) return match[1];
+        const edition =
+          (dir !== cargoRoot
+            ? parseSectionEdition(toml, "workspace.package")
+            : null) ??
+          parseSectionEdition(toml, "package") ??
+          toml.match(/^\s*edition\s*=\s*["'](\d{4})["']/m)?.[1] ??
+          null;
+        if (edition) return edition;
 
         const inheritsWorkspace =
           /^\s*edition\s*\.\s*workspace\s*=\s*true\b/m.test(toml) ||
@@ -385,6 +438,10 @@ function isBoilerplateCargoStderrLine(line: string): boolean {
     /^error:\s+build failed$/.test(t) ||
     /^To learn more, run the command again with --verbose\.$/.test(t)
   );
+}
+
+function isCargoWarningLine(line: string): boolean {
+  return /^warning:\s/i.test(line.trim());
 }
 
 function extractCargoErrors(stdout: string, stderr: string): string[] {
@@ -419,14 +476,20 @@ function extractCargoErrors(stdout: string, stderr: string): string[] {
 
   const trimmedStderr = stderr.trim();
   if (trimmedStderr) {
+    const stderrLines = trimmedStderr
+      .split("\n")
+      .filter((line) => !isBoilerplateCargoStderrLine(line));
+
     if (errors.size === 0) {
-      errors.add(trimmedStderr);
+      if (stderrLines.length > 0) {
+        errors.add(stderrLines.join("\n").trim());
+      }
     } else {
-      const nonBoilerplateLines = trimmedStderr
-        .split("\n")
-        .filter((line) => !isBoilerplateCargoStderrLine(line));
-      if (nonBoilerplateLines.length > 0) {
-        errors.add(nonBoilerplateLines.join("\n").trim());
+      const nonWarningLines = stderrLines.filter(
+        (line) => !isCargoWarningLine(line)
+      );
+      if (nonWarningLines.length > 0) {
+        errors.add(nonWarningLines.join("\n").trim());
       }
     }
   }
@@ -492,7 +555,6 @@ export default function (pi: ExtensionAPI) {
 
   const runtimeState = getRuntimeState();
   const { formattedHashes } = runtimeState;
-  const editedThisTurn = new Set<string>();
 
   let cargoMutex: Promise<unknown> = Promise.resolve();
   const mutationSeqByRoot = new Map<string, number>();
@@ -550,7 +612,7 @@ export default function (pi: ExtensionAPI) {
     readSnapshots.clear();
 
     if (mode !== "compact") {
-      editedThisTurn.clear();
+      session.editedThisTurn.clear();
     }
 
     if (isNewOrSwitchedSession || mode === "tree") {
@@ -648,7 +710,7 @@ export default function (pi: ExtensionAPI) {
 
           const detailsObj = msg.details as Record<string, any> | undefined;
           const guardianDetails = detailsObj?.rustGuardian as
-            | { hash?: unknown; full?: unknown }
+            | { hash?: unknown; full?: unknown; formattedSinceRead?: unknown }
             | undefined;
           const recordedHash =
             typeof guardianDetails?.hash === "string"
@@ -700,10 +762,12 @@ export default function (pi: ExtensionAPI) {
 
           const isFull = thisCallIsFull || carriedFull;
           const formattedSinceReadInWindow =
-            toolName === "read" || toolName === "write"
-              ? false
-              : Boolean(priorInWindow?.formattedSinceRead) ||
-                formattedBetweenPriorAndThis;
+            typeof guardianDetails?.formattedSinceRead === "boolean"
+              ? guardianDetails.formattedSinceRead
+              : toolName === "read" || toolName === "write"
+                ? false
+                : Boolean(priorInWindow?.formattedSinceRead) ||
+                  formattedBetweenPriorAndThis;
 
           windowCoverage.set(absPath, {
             hash: recordedHash,
@@ -846,11 +910,6 @@ export default function (pi: ExtensionAPI) {
         const prior = readSnapshots.get(absPath);
         const wasTruncated =
           (event.details as any)?.truncation?.truncated === true;
-        const isPartialRead =
-          event.toolName === "read" &&
-          (inputObj?.offset !== undefined ||
-            inputObj?.limit !== undefined ||
-            wasTruncated);
 
         let full = false;
         let singleOpFull = false;
@@ -861,7 +920,12 @@ export default function (pi: ExtensionAPI) {
           singleOpFull = true;
           formattedSinceRead = false;
         } else if (event.toolName === "read") {
-          singleOpFull = !isPartialRead;
+          singleOpFull = isFullFileRead(
+            absPath,
+            inputObj?.offset,
+            inputObj?.limit,
+            wasTruncated
+          );
           full = singleOpFull || Boolean(prior?.hash === snap && prior.full);
           formattedSinceRead = false;
         } else if (event.toolName === "edit") {
@@ -879,6 +943,7 @@ export default function (pi: ExtensionAPI) {
         patchedDetails = withGuardianDetails(event.details, {
           hash: snap,
           full: singleOpFull,
+          formattedSinceRead,
         });
         updateFooterStatus(ctx, session);
       }
@@ -888,10 +953,11 @@ export default function (pi: ExtensionAPI) {
       if (event.toolName === "edit") {
         const snapEntry = readSnapshots.get(absPath);
         const currentDiskHash = readSnapshotHash(absPath);
-        const wasReformatted =
-          Boolean(snapEntry?.formattedSinceRead) ||
-          (currentDiskHash !== null &&
-            isKnownFormattedOutputHash(formattedHashes, currentDiskHash));
+        const wasReformatted = shouldHintReformat(
+          snapEntry,
+          currentDiskHash,
+          formattedHashes
+        );
 
         if (wasReformatted) {
           if (ctx.hasUI) {
@@ -918,7 +984,7 @@ export default function (pi: ExtensionAPI) {
       return patchedDetails ? { details: patchedDetails } : undefined;
     }
 
-    editedThisTurn.add(absPath);
+    session.editedThisTurn.add(absPath);
     const cargoRoot = findCargoRoot(absPath);
     if (!cargoRoot) {
       return patchedDetails ? { details: patchedDetails } : undefined;
@@ -1082,11 +1148,11 @@ export default function (pi: ExtensionAPI) {
 
   // 3. SAFE RUSTFMT AT AGENT_END: Format files edited this turn & advance verified snapshots
   pi.on("agent_end", async (_event, ctx) => {
-    if (editedThisTurn.size === 0) return;
-    const filesToFormat = Array.from(editedThisTurn);
-    editedThisTurn.clear();
-
     const session = getSessionState(runtimeState, ctx);
+    if (session.editedThisTurn.size === 0) return;
+    const filesToFormat = Array.from(session.editedThisTurn);
+    session.editedThisTurn.clear();
+
     const { readSnapshots, invalidatedPaths } = session;
 
     await enqueueCargoTask(async () => {
@@ -1179,6 +1245,11 @@ export const _testing = {
   matchesFormattedHash,
   recordFormattedHash,
   isBoilerplateCargoStderrLine,
+  isCargoWarningLine,
+  isFullFileRead,
+  shouldHintReformat,
   canonicalizePath,
   normalizePath,
+  getRuntimeState,
+  getSessionState,
 };
