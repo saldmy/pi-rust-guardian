@@ -10,6 +10,45 @@
 
 `pi-rust-guardian` attaches guardrails and compiler intelligence directly to Pi's core tools (`read`, `write`, `edit`). It requires **0 extra tools**, injects **0 prompt tokens**, avoids KV-cache rewinds on local models, and short-circuits Rust compile feedback into a single turn.
 
+<p align="center">
+  <img src="assets/terminal-preview.png" alt="pi-rust-guardian in Pi TUI" width="820" />
+</p>
+
+```text
+  ● ● ●  📁 π - tui-calculator
+
+  edit src/app.rs
+
+        ...
+  2270        // Typing a character clears it.
+  2271        app.insert("1");
+  2272        assert_eq!(app.committed_result(), None);
+  2273
+  -2274       // Backspace clears it.
+  +2274       // Backspace clears it. `commit` always empties the buffer, so
+  +2275       // simulate a retained result alongside a live draft.
+  2275        app.insert("0");
+  -2276       app.commit();
+  -2277       assert_eq!(app.committed_result(), Some("10"));
+  +2277       app.committed_result = Some("10".to_string());
+  2278        app.backspace();
+  2279        assert_eq!(app.committed_result(), None);
+  2280
+  2281        // `clear()` clears it.
+        ...
+  [rust-guardian] cargo check --all-targets: 0 errors ✓ (0.4s)
+
+  ──────────────────────────────────────────────────────────────────────────────
+  example prompt here█
+  ──────────────────────────────────────────────────────────────────────────────
+  ~/Code/rust/tui-calculator (master)  •  rust-guardian: ready (1 .rs tracked)
+  ↑15k ↓11k R332k CH99.8% 21.2%/131k (auto)  Qwen3.8-27B • medium
+```
+
+* **Inline Top-Line Status**: Status (`rust-guardian: ready (1 .rs tracked)`) is merged directly into **Line 1 (the top line)** of the Pi footer alongside the active directory and branch, avoiding an extra 3rd line.
+* **Inline `edit` Compiler Feedback**: When `cargo check` runs, diagnostics and `rustc` borrow-checker diagrams are attached directly beneath the diff.
+* **`/rust-guardian` Slash Command**: Show tracked `.rs` files, SHA-256 digests, `[FULL]` vs `[PARTIAL]` coverage, and check status.
+
 ---
 
 ## The Problem vs. The Fix
@@ -20,33 +59,6 @@
 | **3-Turn Compiler Lag**<br>Fixing a compile error takes 3 full turns:<br>$$\texttt{edit} \to \texttt{bash("cargo check")} \to \texttt{edit (fix)}$$ | **1-Turn Compiler Loop**<br>Coalesces parallel edits and runs `cargo check --all-targets` in `tool_result`. Multi-line `rustc` borrow-checker diagrams and `help: consider &` hints return on Turn 1. |
 | **Prompt Bloat & KV-Cache Rewinds**<br>LSP extensions register 8–13 new tools, adding 3,500–4,100 tokens to Turn 1 and evicting prompt caches when tools toggle. | **0 Tools, 0 Tokens, Append-Only**<br>Pi's 4 core tools stay untouched. State is stored out-of-context in session DAG entries; inference prompt caches (`vLLM`, `llama.cpp`) stay intact. |
 | **Formatting Desync**<br>Running `rustfmt` mid-turn shifts line numbers for subsequent edits; running it out-of-band triggers stale line errors next turn. | **Deferred `agent_end` Formatting**<br>Runs `rustfmt` after the turn finishes, tracks child `mod` files, updates SHA-256 hash chains, and supplies re-read recovery hints if lines wrapped. |
-
----
-
-## Terminal UI Integration
-
-`pi-rust-guardian` hooks directly into Pi's interactive terminal without creating visual clutter or adding extra lines:
-
-```text
-┌─ ~/Code/my-rust-crate ─── (edit src/lib.rs) ──────────────────────────────────┐
-│                                                                               │
-│  - pub fn process_data(input: String) -> Result<Data, Error> {               │
-│  + pub fn process_data(input: &str) -> Result<Data, Error> {                 │
-│                                                                               │
-│  [rust-guardian] cargo check --all-targets: 1 error(s) — fix before finishing:│
-│  │ error[E0308]: mismatched types                                             │
-│  │   --> src/lib.rs:42:18                                                     │
-│  │    |                                                                       │
-│  │ 42 |     validate(input);                                                  │
-│  │    |     -------- ^^^^^ expected `&str`, found `String`                    │
-│  │    |     help: consider borrowing here: `&input`                           │
-└───────────────────────────────────────────────────────────────────────────────┘
-  ~/Code/my-rust-crate on main  •  rust-guardian: cargo check: 1 error (0.4s) (4 .rs tracked)
-```
-
-1. **Inline Path-Line Status**: Status is rendered alongside the branch line on the footer rather than consuming a 3rd row.
-2. **Inside `edit` Diff Boxes**: Compiler error spans are rendered directly below the diff in the TUI box.
-3. **`/rust-guardian` Command**: Inspect tracked `.rs` files, short hashes, coverage status, and cargo check state at any time.
 
 ---
 
