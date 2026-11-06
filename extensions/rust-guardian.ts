@@ -154,15 +154,16 @@ function getRuntimeState(): GuardianRuntimeState {
   if (!(existing.formattedHashes instanceof Map)) {
     existing.formattedHashes = new Map<string, string>();
   } else {
-    for (const [k, v] of Array.from(existing.formattedHashes.entries())) {
+    const map = existing.formattedHashes as Map<any, any>;
+    for (const [k, v] of Array.from(map.entries())) {
       if (
         v &&
         typeof v === "object" &&
         typeof v.preHash === "string" &&
         typeof v.postHash === "string"
       ) {
-        existing.formattedHashes.delete(k);
-        existing.formattedHashes.set(v.preHash, v.postHash);
+        map.delete(k);
+        map.set(v.preHash, v.postHash);
       }
     }
   }
@@ -344,7 +345,7 @@ function findCargoRoot(filePath: string): string | null {
 }
 
 function detectRustEdition(cargoRoot: string | null): string {
-  if (!cargoRoot) return "2024";
+  if (!cargoRoot) return "2021";
   let dir: string | null = cargoRoot;
   while (dir) {
     const manifestPath = resolve(dir, "Cargo.toml");
@@ -368,7 +369,7 @@ function detectRustEdition(cargoRoot: string | null): string {
     if (parent === dir) break;
     dir = parent;
   }
-  return "2024";
+  return "2021";
 }
 
 function isBoilerplateCargoStderrLine(line: string): boolean {
@@ -994,6 +995,13 @@ export default function (pi: ExtensionAPI) {
 
         const errors = extractCargoErrors(err?.stdout || "", err?.stderr || "");
 
+        if (err?.code === "ENOENT") {
+          errors.push(
+            "cargo executable was not found in PATH. Ensure Rust and Cargo are installed and available in the current environment."
+          );
+          return { ok: false as const, errors, elapsedMs };
+        }
+
         if (err?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
           if (errors.length === 0) {
             errors.push(
@@ -1163,3 +1171,14 @@ export default function (pi: ExtensionAPI) {
     });
   });
 }
+
+export const _testing = {
+  detectRustEdition,
+  extractCargoErrors,
+  formatErrorReport,
+  matchesFormattedHash,
+  recordFormattedHash,
+  isBoilerplateCargoStderrLine,
+  canonicalizePath,
+  normalizePath,
+};

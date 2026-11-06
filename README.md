@@ -1,8 +1,52 @@
 # pi-rust-guardian
 
-`pi-rust-guardian` is a single-file Rust guardrail extension for the [`pi`](https://pi.dev) coding agent. It enforces content-addressed read guards, runs coalesced `cargo check --all-targets` compiler checks on file mutations, and formats touched Rust files with `rustfmt` at the end of each turn.
+[![npm version](https://img.shields.io/npm/v/pi-rust-guardian.svg)](https://www.npmjs.com/package/pi-rust-guardian)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Pi Package](https://img.shields.io/badge/pi--package-extension-purple.svg)](https://pi.dev)
+[![Node >=22.19.0](https://img.shields.io/badge/node-%3E%3D22.19.0-green.svg)](https://nodejs.org)
+[![CI](https://github.com/saldmy/pi-rust-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/saldmy/pi-rust-guardian/actions/workflows/ci.yml)
 
-It operates entirely through `pi` lifecycle hooks (`tool_call`, `tool_result`, `agent_end`, and session events)—registering **0 tools** and **0 skills**, adding **0 tokens** to the system prompt, and keeping the conversation transcript strictly append-only for KV-cache prefix matching.
+> **Zero-tool, zero-prompt-tax Rust compiler feedback and Read-Guard for the [`pi`](https://pi.dev) coding agent.**
+
+`pi-rust-guardian` attaches guardrails and compiler intelligence directly to Pi's core tools (`read`, `write`, `edit`). It requires **0 extra tools**, injects **0 prompt tokens**, avoids KV-cache rewinds on local models, and short-circuits Rust compile feedback into a single turn.
+
+---
+
+## The Problem vs. The Fix
+
+| The Classic Agent Failure Mode | How `pi-rust-guardian` Fixes It |
+| :--- | :--- |
+| **Silent File Truncation**<br>The agent reads lines 1–80 of a 600-line file (or hits output truncation), then calls `write()`—silently wiping out lines 81–600. | **Content-Addressed Read-Guard**<br>Tracks SHA-256 digests and `full` vs `partial` read coverage. Targeted `edit` is allowed, but whole-file `write` is blocked until the complete file is read. |
+| **3-Turn Compiler Lag**<br>Fixing a compile error takes 3 full turns:<br>$$\texttt{edit} \to \texttt{bash("cargo check")} \to \texttt{edit (fix)}$$ | **1-Turn Compiler Loop**<br>Coalesces parallel edits and runs `cargo check --all-targets` in `tool_result`. Multi-line `rustc` borrow-checker diagrams and `help: consider &` hints return on Turn 1. |
+| **Prompt Bloat & KV-Cache Rewinds**<br>LSP extensions register 8–13 new tools, adding 3,500–4,100 tokens to Turn 1 and evicting prompt caches when tools toggle. | **0 Tools, 0 Tokens, Append-Only**<br>Pi's 4 core tools stay untouched. State is stored out-of-context in session DAG entries; inference prompt caches (`vLLM`, `llama.cpp`) stay intact. |
+| **Formatting Desync**<br>Running `rustfmt` mid-turn shifts line numbers for subsequent edits; running it out-of-band triggers stale line errors next turn. | **Deferred `agent_end` Formatting**<br>Runs `rustfmt` after the turn finishes, tracks child `mod` files, updates SHA-256 hash chains, and supplies re-read recovery hints if lines wrapped. |
+
+---
+
+## Terminal UI Integration
+
+`pi-rust-guardian` hooks directly into Pi's interactive terminal without creating visual clutter or adding extra lines:
+
+```text
+┌─ ~/Code/my-rust-crate ─── (edit src/lib.rs) ──────────────────────────────────┐
+│                                                                               │
+│  - pub fn process_data(input: String) -> Result<Data, Error> {               │
+│  + pub fn process_data(input: &str) -> Result<Data, Error> {                 │
+│                                                                               │
+│  [rust-guardian] cargo check --all-targets: 1 error(s) — fix before finishing:│
+│  │ error[E0308]: mismatched types                                             │
+│  │   --> src/lib.rs:42:18                                                     │
+│  │    |                                                                       │
+│  │ 42 |     validate(input);                                                  │
+│  │    |     -------- ^^^^^ expected `&str`, found `String`                    │
+│  │    |     help: consider borrowing here: `&input`                           │
+└───────────────────────────────────────────────────────────────────────────────┘
+  ~/Code/my-rust-crate on main  •  rust-guardian: cargo check: 1 error (0.4s) (4 .rs tracked)
+```
+
+1. **Inline Path-Line Status**: Status is rendered alongside the branch line on the footer rather than consuming a 3rd row.
+2. **Inside `edit` Diff Boxes**: Compiler error spans are rendered directly below the diff in the TUI box.
+3. **`/rust-guardian` Command**: Inspect tracked `.rs` files, short hashes, coverage status, and cargo check state at any time.
 
 ---
 
@@ -30,9 +74,7 @@ A naive Read-Guard only tracks a `Set<string>` of file paths the agent has touch
 
 * **Blocks Blind Hallucinated Edits**: If the agent attempts to `edit` or `write` an existing `.rs` file it has not read in the current session, the call is blocked in `tool_call` before disk I/O occurs.
 * **Catches Out-of-Band File Drift**: On every `edit` or `write`, the file’s current SHA-256 hash on disk is compared against the recorded snapshot. If the file was modified outside `read`/`edit`/`write` (for example via `sed` or `cargo fix` in `bash`, or by the user in an external editor), the hash mismatch is caught and the agent is forced to re-read the file before patching stale lines.
-* **Prevents Partial-Read File Truncation**: A common destructive agent failure mode occurs when a model reads a 600-line file using `read(path, offset: 1, limit: 80)` (or hits `pi`’s output truncation limit), and then calls `write(path, content)`—silently deleting lines 81–600.
-  * When a `.rs` file is read with `offset`/`limit` or truncated (`details.truncation.truncated === true`), `pi-rust-guardian` records `full: false`.
-  * When `full === false`, **targeted `edit` calls are allowed**, but **full-file `write` overwrites are blocked** until the agent reads the complete file.
+* **Prevents Partial-Read File Truncation**: When a `.rs` file is read with `offset`/`limit` or truncated (`details.truncation.truncated === true`), `pi-rust-guardian` records `full: false`. When `full === false`, **targeted `edit` calls are allowed**, but **full-file `write` overwrites are blocked** until the agent reads the complete file.
 
 ### 2. Compaction-Aware Context Synchronization (`syncFromBranch`)
 When a long session hits the context limit and `pi` compacts the history, early turns are replaced by a lossy summary while recent turns starting from `compactionEntry.firstKeptEntryId` remain verbatim in context.
@@ -71,16 +113,6 @@ Code formatting creates a classic conflict for coding agents: running `rustfmt` 
 
 ---
 
-## TUI Integration
-
-In `pi`, the built-in `edit` and `write` TUI components do not render `result.content` on non-error calls (`edit` only renders `details.diff`, and `write` only renders `args.content`). `pi-rust-guardian` surfaces its activity in the TUI without affecting the LLM prompt:
-
-1. **Inline Path-Line Status**: Wraps `FooterComponent.prototype.render` so status (`rust-guardian: cargo check ok (0.4s) (3 .rs tracked)`) is rendered inline on the top path/branch line of the footer rather than adding a 3rd footer row.
-2. **Inside `edit` Diff Boxes**: Appends `[rust-guardian] cargo check --all-targets: ...` (and `│ `-prefixed compiler errors) to `details.diff` so diagnostics appear directly inside the TUI `edit` box beneath the diff.
-3. **`/rust-guardian` Command**: Displays a summary notification of all `.rs` files currently tracked in the active window, their short SHA-256 hashes, `[FULL]` vs. `[PARTIAL]` coverage, and `rustfmt` status.
-
----
-
 ## Comparison With Other Extensions
 
 | Feature | `pi-rust-guardian` | `pi-lens` | `@piex-dev/lsp` | `@narumitw/pi-lsp` |
@@ -106,7 +138,7 @@ In `pi`, the built-in `edit` and `write` TUI components do not render `result.co
 **Not a fit for:**
 * **Polyglot repositories**: `pi-rust-guardian` only intercepts `.rs` files and Cargo workspaces. For multi-language repositories (TypeScript, Python, Go, etc.), use `pi-lens` or `@piex-dev/lsp`.
 * **Agent-driven LSP/AST navigation**: If you want the model to explicitly invoke tools like `ast_grep_search` or `lsp_navigation` (go-to-definition / find-references), this extension intentionally does not register any tools.
-* **Un-cached monoliths with >60s incremental checks**: Because `cargo check --all-targets` runs after `.rs` edits settle, it works best on crates and workspaces where incremental checks complete in a few seconds.
+* **Uncached monoliths with >60s incremental checks**: Because `cargo check --all-targets` runs after `.rs` edits settle, it works best on crates and workspaces where incremental checks complete in a few seconds.
 
 ---
 
@@ -117,9 +149,9 @@ In `pi`, the built-in `edit` and `write` TUI components do not render `result.co
 pi install npm:pi-rust-guardian
 
 # Or install from GitHub
-pi install git:github.com/<your-username>/pi-rust-guardian
+pi install git:github.com/saldmy/pi-rust-guardian
 
-# Or load for a single session
+# Or test for a single session without saving
 pi -e npm:pi-rust-guardian
 ```
 
@@ -132,6 +164,27 @@ pi -e npm:pi-rust-guardian
 ### Slash Commands
 * **`/rust-guardian`** — Show tracked `.rs` files, short SHA-256 hashes, `[FULL]` / `[PARTIAL]` read coverage, and the latest `cargo check` summary.
 
+---
+
+## Development & Testing
+
+```bash
+# Clone the repository
+git clone https://github.com/saldmy/pi-rust-guardian.git
+cd pi-rust-guardian
+
+# Install dependencies
+npm install
+
+# Run type checking
+npm run typecheck
+
+# Run unit tests
+npm test
+```
+
+---
+
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 Dmytro Salo

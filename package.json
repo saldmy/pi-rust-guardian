@@ -3,6 +3,15 @@
   "version": "1.0.0",
   "description": "Zero-tool, zero-prompt-tax Rust guardrails for Pi: content-addressed Read-Guard, coalesced cargo check diagnostics with rustc help hints, and DAG-persisted rustfmt tracking.",
   "type": "module",
+  "author": "Dmytro Salo <dmytrosalo@protonmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saldmy/pi-rust-guardian.git"
+  },
+  "bugs": {
+    "url": "https://github.com/saldmy/pi-rust-guardian/issues"
+  },
+  "homepage": "https://github.com/saldmy/pi-rust-guardian#readme",
   "files": [
     "extensions",
     "README.md",
@@ -18,7 +27,12 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/rust-guardian.test.ts",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "pi": {
     "extensions": [
