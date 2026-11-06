@@ -11,41 +11,57 @@
 `pi-rust-guardian` attaches guardrails and compiler intelligence directly to Pi's core tools (`read`, `write`, `edit`). It requires **0 extra tools**, injects **0 prompt tokens**, avoids KV-cache rewinds on local models, and short-circuits Rust compile feedback into a single turn.
 
 ```text
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ ● ● ●  📁 π - tui-calculator                                                 │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ edit src/app.rs                                                              │
-│                                                                              │
-│       ...                                                                    │
-│ 2270        // Typing a character clears it.                                 │
-│ 2271        app.insert("1");                                                 │
-│ 2272        assert_eq!(app.committed_result(), None);                       │
-│ 2273                                                                         │
-│ -2274       // Backspace clears it.                                          │
-│ +2274       // Backspace clears it. `commit` always empties the buffer, so   │
-│ +2275       // simulate a retained result alongside a live draft.            │
-│ 2275        app.insert("0");                                                 │
-│ -2276       app.commit();                                                    │
-│ -2277       assert_eq!(app.committed_result(), Some("10"));                  │
-│ +2277       app.committed_result = Some("10".to_string());                   │
-│ 2278        app.backspace();                                                 │
-│ 2279        assert_eq!(app.committed_result(), None);                       │
-│ 2280                                                                         │
-│ 2281        // `clear()` clears it.                                          │
-│       ...                                                                    │
-│ [rust-guardian] cargo check --all-targets: 0 errors ✓ (0.4s)                  │
-│                                                                              │
-│ ──────────────────────────────────────────────────────────────────────────── │
-│ example prompt here█                                                         │
-│ ──────────────────────────────────────────────────────────────────────────── │
-│ ~/Code/rust/tui-calculator (master)  •  rust-guardian: ready (1 .rs tracked) │
-│ ↑15k ↓11k R332k CH99.8% 21.2%/131k (auto)  Qwen3.8-27B • medium             │
-╰──────────────────────────────────────────────────────────────────────────────╯
+  Traditional Flow (3 Turns):
+    Turn 1: edit ──────► Turn 2: bash("cargo check") ──────► Turn 3: edit (fix)
+
+  pi-rust-guardian Flow (1 Turn):
+    Turn 1: edit ──► [ Coalesced cargo check ] ──► tool_result with rustc help spans ──► Turn 2: fix!
+  ─────────────────────────────────────────────────────────────────────────────────────────────
+
+                 COALESCED, PER-CRATE SERIALIZED COMPILER PIPELINE
+                 ═════════════════════════════════════════════════
+
+  Agent Turn: Parallel .rs Edits
+  ┌──────────────────────────────┐
+  │ edit("src/types.rs")    (t=0)│ ──► seq: 1 ──┐
+  │ edit("src/models.rs")   (t=6)│ ──► seq: 2 ──┼─► [ 25ms Batch Settle Window ]
+  │ edit("src/main.rs")    (t=18)│ ──► seq: 3 ──┘                 │
+  └──────────────────────────────┘                                │
+                                  ┌───────────────────────────────┘
+                                  ▼
+  Per-Root Sequence Check (mutationSeqByRoot):
+    ├── seq 1 < 3  ──► [ SKIPPED ]   Avoids target/.cargo-lock contention
+    ├── seq 2 < 3  ──► [ SKIPPED ]   Avoids false errors on partial edits
+    └── seq 3 == 3 ──► [ CLAIMED ]   Batch tail proceeds to execution
+                             │
+                             ▼
+                 [ Cargo Promise Mutex ] ◄── Serializes across async turns
+                             │
+                             ▼
+              cargo check --all-targets (Runs 1x on settled crate)
+                             │
+              ┌──────────────┴──────────────┐
+              ▼                             ▼
+       stdout (NDJSON)                stderr (Text)
+              │                             │
+    Parse compiler-message          Strip summary boilerplate
+    Extract message.level=="error"  Keep build.rs / manifest panics
+    Discard warning clutter                 │
+              │                             │
+              └──────────────┬──────────────┘
+                             ▼
+                 High-Signal Error Diagnostics
+                 ├── Multi-line borrow-checker lifetime graphs
+                 ├── Compiler-generated `help:` suggestions
+                 └── Full unit & integration test coverage
+                             │
+                             ▼
+        Appended directly to final edit's tool_result
 ```
 
-* **Inline Top-Line Status**: Status (`rust-guardian: ready (1 .rs tracked)`) is merged directly into **Line 1 (the top line)** of the Pi footer alongside the active directory and branch, avoiding an extra 3rd line.
-* **Inline `edit` Compiler Feedback**: When `cargo check` runs, diagnostics and `rustc` borrow-checker diagrams are attached directly beneath the diff.
-* **`/rust-guardian` Slash Command**: Show tracked `.rs` files, SHA-256 digests, `[FULL]` vs `[PARTIAL]` coverage, and check status.
+* **Zero-Turnaround Compiler Feedback**: Diagnostics are returned in the same turn as the edit, cutting the fix loop from 3 turns to 1.
+* **Batch Coalescing**: Parallel multi-file edits settle within 25ms so `cargo check` executes once per batch instead of thrashing `target/.cargo-lock`.
+* **Zero Prompt Tax**: Operates purely via Pi lifecycle hooks—no new tools registered, keeping the KV-cache intact for local models.
 
 ---
 
