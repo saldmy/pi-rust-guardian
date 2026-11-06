@@ -1,0 +1,36 @@
+{
+  "name": "pi-rust-guardian",
+  "version": "1.0.0",
+  "description": "Zero-tool, zero-prompt-tax Rust guardrails for Pi: content-addressed Read-Guard, coalesced cargo check diagnostics with rustc help hints, and DAG-persisted rustfmt tracking.",
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "rust",
+    "cargo",
+    "rustfmt",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/rust-guardian.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
