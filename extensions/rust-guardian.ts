@@ -191,6 +191,9 @@ function getSessionState(
   if (!session) {
     const migrated = runtime.sessions.get("default");
     if (migrated && key !== "default") {
+      if (!(migrated.editedThisTurn instanceof Set)) {
+        migrated.editedThisTurn = new Set<string>();
+      }
       runtime.sessions.delete("default");
       runtime.sessions.set(key, migrated);
       return migrated;
@@ -201,6 +204,8 @@ function getSessionState(
       editedThisTurn: new Set<string>(),
     };
     runtime.sessions.set(key, session);
+  } else if (!(session.editedThisTurn instanceof Set)) {
+    session.editedThisTurn = new Set<string>();
   }
   return session;
 }
@@ -384,10 +389,17 @@ function parseSectionEdition(
   sectionHeader: string
 ): string | null {
   const escaped = sectionHeader.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const regex = new RegExp(`\\[${escaped}\\]([^\\[]*)`, "m");
-  const match = toml.match(regex);
-  if (!match?.[1]) return null;
-  const editionMatch = match[1].match(/^\s*edition\s*=\s*["'](\d{4})["']/m);
+  const headerRegex = new RegExp(`^\\s*\\[${escaped}\\]\\s*(?:#.*)?$`, "m");
+  const headerMatch = headerRegex.exec(toml);
+  if (!headerMatch) return null;
+
+  const afterHeader = toml.slice(headerMatch.index + headerMatch[0].length);
+  const nextSectionMatch = /^\s*\[/m.exec(afterHeader);
+  const sectionBody = nextSectionMatch
+    ? afterHeader.slice(0, nextSectionMatch.index)
+    : afterHeader;
+
+  const editionMatch = sectionBody.match(/^\s*edition\s*=\s*["'](\d{4})["']/m);
   return editionMatch?.[1] ?? null;
 }
 
@@ -401,9 +413,10 @@ function detectRustEdition(cargoRoot: string | null): string {
         const toml = readFileSync(manifestPath, "utf8");
         const edition =
           (dir !== cargoRoot
-            ? parseSectionEdition(toml, "workspace.package")
-            : null) ??
-          parseSectionEdition(toml, "package") ??
+            ? parseSectionEdition(toml, "workspace.package") ??
+              parseSectionEdition(toml, "package")
+            : parseSectionEdition(toml, "package") ??
+              parseSectionEdition(toml, "workspace.package")) ??
           toml.match(/^\s*edition\s*=\s*["'](\d{4})["']/m)?.[1] ??
           null;
         if (edition) return edition;
@@ -723,9 +736,9 @@ export default function (pi: ExtensionAPI) {
             thisCallIsFull = true;
           } else if (toolName === "read") {
             thisCallIsFull =
-              !isPartialRead &&
-              !wasTruncated &&
-              guardianDetails?.full !== false;
+              typeof guardianDetails?.full === "boolean"
+                ? !wasTruncated && guardianDetails.full
+                : !isPartialRead && !wasTruncated;
           }
 
           const priorInWindow = windowCoverage.get(absPath);
@@ -1240,6 +1253,7 @@ export default function (pi: ExtensionAPI) {
 
 export const _testing = {
   detectRustEdition,
+  parseSectionEdition,
   extractCargoErrors,
   formatErrorReport,
   matchesFormattedHash,

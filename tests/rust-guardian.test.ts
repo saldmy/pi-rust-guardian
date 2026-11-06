@@ -9,6 +9,7 @@ import rustGuardian, { _testing } from "../extensions/rust-guardian.ts";
 
 const {
   detectRustEdition,
+  parseSectionEdition,
   extractCargoErrors,
   formatErrorReport,
   matchesFormattedHash,
@@ -328,6 +329,20 @@ describe("extractCargoErrors warning filtering", () => {
 });
 
 describe("detectRustEdition section-aware parsing", () => {
+  it("parses edition even when array fields appear before edition", () => {
+    const toml = [
+      "[workspace.package]",
+      'authors = ["Alice <alice@example.com>", "Bob <bob@example.com>"]',
+      'keywords = ["pi", "rust", "extension"]',
+      'edition = "2024"',
+      "",
+      "[dependencies]",
+      'serde = { version = "1.0", features = ["derive"] }',
+    ].join("\n");
+
+    assert.equal(parseSectionEdition(toml, "workspace.package"), "2024");
+  });
+
   it("prefers [workspace.package] edition over [package] edition in mixed root manifests", () => {
     const rootDir = mkdtempSync(join(tmpdir(), "rg-mixed-"));
     const memberDir = join(rootDir, "crates", "member");
@@ -335,7 +350,20 @@ describe("detectRustEdition section-aware parsing", () => {
       mkdirSync(memberDir, { recursive: true });
       writeFileSync(
         join(rootDir, "Cargo.toml"),
-        ["[package]", 'name = "root"', 'version = "0.1.0"', 'edition = "2018"', "", "[workspace.package]", 'edition = "2024"', "", "[workspace]", 'members = ["crates/*"]'].join("\n")
+        [
+          "[package]",
+          'name = "root"',
+          'version = "0.1.0"',
+          'authors = ["Root Author <root@example.com>"]',
+          'edition = "2018"',
+          "",
+          "[workspace.package]",
+          'authors = ["Workspace Author <ws@example.com>"]',
+          'edition = "2024"',
+          "",
+          "[workspace]",
+          'members = ["crates/*"]',
+        ].join("\n")
       );
       writeFileSync(
         join(memberDir, "Cargo.toml"),
@@ -364,9 +392,92 @@ describe("session isolation for editedThisTurn", () => {
     assert.notEqual(a.editedThisTurn, b.editedThisTurn);
     assert.equal(b.editedThisTurn.size, 0);
   });
+
+  it("backfills editedThisTurn on legacy session state objects during reload", () => {
+    const runtime = getRuntimeState();
+    const key = `legacy-${Date.now()}`;
+    (runtime.sessions as Map<string, any>).set(key, {
+      readSnapshots: new Map(),
+      invalidatedPaths: new Set(),
+      // editedThisTurn intentionally undefined as in prior version
+    });
+
+    const ctx = {
+      cwd: tmpdir(),
+      hasUI: false,
+      sessionManager: { getSessionId: () => key },
+    } as any;
+
+    const session = getSessionState(runtime, ctx);
+    assert.ok(session.editedThisTurn instanceof Set);
+    assert.doesNotThrow(() => session.editedThisTurn.clear());
+  });
 });
 
-describe("syncFromBranch replay preserves formattedSinceRead", () => {
+describe("syncFromBranch replay preserves formattedSinceRead and guardianDetails.full", () => {
+  it("retains guardianDetails.full: true from read toolResult with offset/limit", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rg-full-replay-"));
+    const srcDir = join(tempDir, "src");
+    const filePath = join(srcDir, "lib.rs");
+    try {
+      mkdirSync(srcDir, { recursive: true });
+      const fileContent = "pub fn foo() {}\n";
+      writeFileSync(filePath, fileContent);
+      const h1 = createHash("sha256").update(fileContent).digest("hex");
+
+      const handlers: Record<string, ((...args: any[]) => any)[]> = {};
+      const mockPi = {
+        registerCommand: () => {},
+        on: (name: string, cb: (...args: any[]) => any) => {
+          handlers[name] = [cb];
+        },
+        appendEntry: () => {},
+      } as any;
+      rustGuardian(mockPi);
+
+      const sessionId = `full-replay-${Date.now()}`;
+      const ctx = {
+        cwd: tempDir,
+        hasUI: false,
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getBranch: () => [
+            {
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "toolCall",
+                    id: "c_read",
+                    name: "read",
+                    arguments: { path: "src/lib.rs", offset: 1, limit: 100 },
+                  },
+                ],
+              },
+            },
+            {
+              message: {
+                role: "toolResult",
+                toolCallId: "c_read",
+                isError: false,
+                details: { rustGuardian: { hash: h1, full: true } },
+              },
+            },
+          ],
+        },
+      } as any;
+
+      await handlers.session_start[0]({}, ctx);
+
+      const session = getSessionState(getRuntimeState(), ctx);
+      const snap = session.readSnapshots.get(normalizePath(tempDir, "src/lib.rs"));
+      assert.ok(snap);
+      assert.equal(snap!.full, true, "expected full to be true from guardianDetails.full");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("retains formattedSinceRead: true from edit toolResult details during replay", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "rg-replay-"));
     const srcDir = join(tempDir, "src");
