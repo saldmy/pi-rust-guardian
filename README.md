@@ -8,60 +8,29 @@
 
 > **Zero-tool, zero-prompt-tax Rust compiler feedback and Read-Guard for the [`pi`](https://pi.dev) coding agent.**
 
-`pi-rust-guardian` attaches guardrails and compiler intelligence directly to Pi's core tools (`read`, `write`, `edit`). It requires **0 extra tools**, injects **0 prompt tokens**, avoids KV-cache rewinds on local models, and short-circuits Rust compile feedback into a single turn.
+`pi-rust-guardian` attaches guardrails and compiler intelligence directly to Pi's core tools (`read`, `write`, `edit`). It registers **0 extra tools**, injects **0 prompt tokens**, avoids KV-cache rewinds on local models, and short-circuits Rust compile feedback into a single turn.
 
-```text
-  Traditional Flow (3 Turns):
-    Turn 1: edit ──────► Turn 2: bash("cargo check") ──────► Turn 3: edit (fix)
-
-  pi-rust-guardian Flow (1 Turn):
-    Turn 1: edit ──► [ Coalesced cargo check ] ──► tool_result with rustc help spans ──► Turn 2: fix!
-  ─────────────────────────────────────────────────────────────────────────────────────────────
-
-                 COALESCED, PER-CRATE SERIALIZED COMPILER PIPELINE
-                 ═════════════════════════════════════════════════
-
-  Agent Turn: Parallel .rs Edits
-  ┌──────────────────────────────┐
-  │ edit("src/types.rs")    (t=0)│ ──► seq: 1 ──┐
-  │ edit("src/models.rs")   (t=6)│ ──► seq: 2 ──┼─► [ 25ms Batch Settle Window ]
-  │ edit("src/main.rs")    (t=18)│ ──► seq: 3 ──┘                 │
-  └──────────────────────────────┘                                │
-                                  ┌───────────────────────────────┘
-                                  ▼
-  Per-Root Sequence Check (mutationSeqByRoot):
-    ├── seq 1 < 3  ──► [ SKIPPED ]   Avoids target/.cargo-lock contention
-    ├── seq 2 < 3  ──► [ SKIPPED ]   Avoids false errors on partial edits
-    └── seq 3 == 3 ──► [ CLAIMED ]   Batch tail proceeds to execution
-                             │
-                             ▼
-                 [ Cargo Promise Mutex ] ◄── Serializes across async turns
-                             │
-                             ▼
-              cargo check --all-targets (Runs 1x on settled crate)
-                             │
-              ┌──────────────┴──────────────┐
-              ▼                             ▼
-       stdout (NDJSON)                stderr (Text)
-              │                             │
-    Parse compiler-message          Strip summary boilerplate
-    Extract message.level=="error"  Keep build.rs / manifest panics
-    Discard warning clutter                 │
-              │                             │
-              └──────────────┬──────────────┘
-                             ▼
-                 High-Signal Error Diagnostics
-                 ├── Multi-line borrow-checker lifetime graphs
-                 ├── Compiler-generated `help:` suggestions
-                 └── Full unit & integration test coverage
-                             │
-                             ▼
-        Appended directly to final edit's tool_result
+```bash
+pi install npm:pi-rust-guardian
 ```
 
-* **Zero-Turnaround Compiler Feedback**: Diagnostics are returned in the same turn as the edit, cutting the fix loop from 3 turns to 1.
-* **Batch Coalescing**: Parallel multi-file edits settle within 25ms so `cargo check` executes once per batch instead of thrashing `target/.cargo-lock`.
-* **Zero Prompt Tax**: Operates purely via Pi lifecycle hooks—no new tools registered, keeping the KV-cache intact for local models.
+```text
+ 40   fn get_count() -> Result<usize, AppError> {
+-41       Ok(count)
++41       count
+ 42   }
+[rust-guardian] cargo check --all-targets: 1 error(s) — fix before finishing:
+│ error[E0308]: mismatched types
+│   --> src/lib.rs:41:5
+│    |
+│ 41 |     count
+│    |     ^^^^^ expected `Result<usize, AppError>`, found `usize`
+│    |
+│ help: try wrapping the expression in `Ok`
+│    |
+│ 41 |     Ok(count)
+│    |     +++     +
+```
 
 ---
 
@@ -70,7 +39,7 @@
 | The Classic Agent Failure Mode | How `pi-rust-guardian` Fixes It |
 | :--- | :--- |
 | **Silent File Truncation**<br>The agent reads lines 1–80 of a 600-line file (or hits output truncation), then calls `write()`—silently wiping out lines 81–600. | **Content-Addressed Read-Guard**<br>Tracks SHA-256 digests and `full` vs `partial` read coverage. Targeted `edit` is allowed, but whole-file `write` is blocked until the complete file is read. |
-| **3-Turn Compiler Lag**<br>Fixing a compile error takes 3 full turns:<br>$$\texttt{edit} \to \texttt{bash("cargo check")} \to \texttt{edit (fix)}$$ | **1-Turn Compiler Loop**<br>Coalesces parallel edits and runs `cargo check --all-targets` in `tool_result`. Multi-line `rustc` borrow-checker diagrams and `help: consider &` hints return on Turn 1. |
+| **3-Turn Compiler Lag**<br>Fixing a compile error takes 3 full turns:<br>`edit` → `bash("cargo check")` → `edit (fix)` | **1-Turn Compiler Loop**<br>Coalesces parallel edits and runs `cargo check --all-targets` in `tool_result`. Multi-line `rustc` borrow-checker diagrams and `help: consider &` hints return on Turn 1. |
 | **Prompt Bloat & KV-Cache Rewinds**<br>LSP extensions register 8–13 new tools, adding 3,500–4,100 tokens to Turn 1 and evicting prompt caches when tools toggle. | **0 Tools, 0 Tokens, Append-Only**<br>Pi's 4 core tools stay untouched. State is stored out-of-context in session DAG entries; inference prompt caches (`vLLM`, `llama.cpp`) stay intact. |
 | **Formatting Desync**<br>Running `rustfmt` mid-turn shifts line numbers for subsequent edits; running it out-of-band triggers stale line errors next turn. | **Deferred `agent_end` Formatting**<br>Runs `rustfmt` after the turn finishes, tracks child `mod` files, updates SHA-256 hash chains, and supplies re-read recovery hints if lines wrapped. |
 
@@ -109,9 +78,7 @@ When a long session hits the context limit and `pi` compacts the history, early 
 * **Automatic Coverage Downgrading**: If the agent performed a full `read` of `src/lib.rs` on Turn 3 (now compacted out of context) and a small `edit` on Turn 30 (still in the active window), `src/lib.rs` is downgraded from `full: true` to `full: false`. The agent can continue making surgical `edit` calls around the code it recently touched without being forced into an unnecessary re-read, but it is blocked from overwriting the entire file with `write` from compacted memory.
 
 ### 3. Coalesced, Per-Crate Serialized Compiler Feedback
-Without a post-edit hook, fixing a compile error takes three turns:
-$$\text{Turn 1: } \texttt{edit} \longrightarrow \text{Turn 2: } \texttt{bash("cargo check")} \longrightarrow \text{Turn 3: } \texttt{edit (fix)}$$
-By running `cargo check --all-targets` inside `tool_result`, diagnostics are returned in the **same turn** as the `edit` or `write`.
+By running `cargo check --all-targets` inside `tool_result`, diagnostics are returned in the **same turn** as the `edit` or `write` rather than requiring a separate `bash("cargo check")` turn.
 
 * **25ms Parallel Batch Coalescing**: In `pi`, when an agent updates a struct definition and its callers across 3 `.rs` files in a single turn (`edit("a.rs")`, `edit("b.rs")`, `edit("c.rs")`), those edits execute in parallel. Without coalescing, `a.rs` would trigger `cargo check` before `b.rs` and `c.rs` finish writing to disk—reporting false errors on an intermediate state and spawning 3 concurrent `cargo` processes that contend on `target/.cargo-lock`.
 * `pi-rust-guardian` increments a per-Cargo-root sequence counter (`mutationSeqByRoot`), waits `25ms` (`BATCH_SETTLE_MS`) for sibling writes in the same turn to land on disk, and verifies the sequence counter both before and inside a promise mutex (`enqueueCargoTask`). Earlier edits in the batch step aside cleanly, and `cargo check` runs **once** on the final edit of the batch.
