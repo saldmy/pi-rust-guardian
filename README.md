@@ -10,39 +10,37 @@
 
 `pi-rust-guardian` attaches guardrails and compiler intelligence directly to Pi's core tools (`read`, `write`, `edit`). It requires **0 extra tools**, injects **0 prompt tokens**, avoids KV-cache rewinds on local models, and short-circuits Rust compile feedback into a single turn.
 
-<p align="center">
-  <img src="assets/terminal-preview.png" alt="pi-rust-guardian in Pi TUI" width="820" />
-</p>
-
 ```text
-  ● ● ●  📁 π - tui-calculator
-
-  edit src/app.rs
-
-        ...
-  2270        // Typing a character clears it.
-  2271        app.insert("1");
-  2272        assert_eq!(app.committed_result(), None);
-  2273
-  -2274       // Backspace clears it.
-  +2274       // Backspace clears it. `commit` always empties the buffer, so
-  +2275       // simulate a retained result alongside a live draft.
-  2275        app.insert("0");
-  -2276       app.commit();
-  -2277       assert_eq!(app.committed_result(), Some("10"));
-  +2277       app.committed_result = Some("10".to_string());
-  2278        app.backspace();
-  2279        assert_eq!(app.committed_result(), None);
-  2280
-  2281        // `clear()` clears it.
-        ...
-  [rust-guardian] cargo check --all-targets: 0 errors ✓ (0.4s)
-
-  ──────────────────────────────────────────────────────────────────────────────
-  example prompt here█
-  ──────────────────────────────────────────────────────────────────────────────
-  ~/Code/rust/tui-calculator (master)  •  rust-guardian: ready (1 .rs tracked)
-  ↑15k ↓11k R332k CH99.8% 21.2%/131k (auto)  Qwen3.8-27B • medium
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ● ● ●  📁 π - tui-calculator                                                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ edit src/app.rs                                                              │
+│                                                                              │
+│       ...                                                                    │
+│ 2270        // Typing a character clears it.                                 │
+│ 2271        app.insert("1");                                                 │
+│ 2272        assert_eq!(app.committed_result(), None);                       │
+│ 2273                                                                         │
+│ -2274       // Backspace clears it.                                          │
+│ +2274       // Backspace clears it. `commit` always empties the buffer, so   │
+│ +2275       // simulate a retained result alongside a live draft.            │
+│ 2275        app.insert("0");                                                 │
+│ -2276       app.commit();                                                    │
+│ -2277       assert_eq!(app.committed_result(), Some("10"));                  │
+│ +2277       app.committed_result = Some("10".to_string());                   │
+│ 2278        app.backspace();                                                 │
+│ 2279        assert_eq!(app.committed_result(), None);                       │
+│ 2280                                                                         │
+│ 2281        // `clear()` clears it.                                          │
+│       ...                                                                    │
+│ [rust-guardian] cargo check --all-targets: 0 errors ✓ (0.4s)                  │
+│                                                                              │
+│ ──────────────────────────────────────────────────────────────────────────── │
+│ example prompt here█                                                         │
+│ ──────────────────────────────────────────────────────────────────────────── │
+│ ~/Code/rust/tui-calculator (master)  •  rust-guardian: ready (1 .rs tracked) │
+│ ↑15k ↓11k R332k CH99.8% 21.2%/131k (auto)  Qwen3.8-27B • medium             │
+╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
 * **Inline Top-Line Status**: Status (`rust-guardian: ready (1 .rs tracked)`) is merged directly into **Line 1 (the top line)** of the Pi footer alongside the active directory and branch, avoiding an extra 3rd line.

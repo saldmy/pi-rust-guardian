@@ -14,7 +14,6 @@
   "homepage": "https://github.com/saldmy/pi-rust-guardian#readme",
   "files": [
     "extensions",
-    "assets",
     "README.md",
     "LICENSE"
   ],
