@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import rustGuardian, { _testing } from "../extensions/rust-guardian.ts";
+import rustGuardian, { _testing } from "../extensions/index.ts";
 
 const {
   detectRustEdition,

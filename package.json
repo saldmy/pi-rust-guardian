@@ -1,6 +1,6 @@
 {
   "name": "pi-rust-guardian",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Zero-tool, zero-prompt-tax Rust guardrails for Pi: content-addressed Read-Guard, coalesced cargo check diagnostics with rustc help hints, and DAG-persisted rustfmt tracking.",
   "type": "module",
   "author": "Dmytro Salo <dmytrosalo@protonmail.com>",
@@ -36,7 +36,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/rust-guardian.ts"
+      "./extensions/index.ts"
     ]
   },
   "peerDependencies": {
