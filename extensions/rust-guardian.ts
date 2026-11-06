@@ -109,10 +109,16 @@ function installPathLineFooterPatch(): void {
       if (visibleWidth(combined) <= width) {
         lines[0] = combined;
       } else {
-        const available = width - visibleWidth(lines[0]) - visibleWidth(sep);
+        let baseLine = lines[0];
+        let available = width - visibleWidth(baseLine) - visibleWidth(sep);
+        if (available <= 10 && width >= 40) {
+          const maxBaseWidth = Math.max(15, Math.floor(width * 0.55));
+          baseLine = truncateToWidth(baseLine, maxBaseWidth);
+          available = width - visibleWidth(baseLine) - visibleWidth(sep);
+        }
         if (available > 10) {
           lines[0] = truncateToWidth(
-            `${lines[0]}${sep}${truncateToWidth(cleanRg, available)}`,
+            `${baseLine}${sep}${truncateToWidth(cleanRg, available)}`,
             width
           );
         }
@@ -394,7 +400,8 @@ function parseSectionEdition(
   if (!headerMatch) return null;
 
   const afterHeader = toml.slice(headerMatch.index + headerMatch[0].length);
-  const nextSectionMatch = /^\s*\[/m.exec(afterHeader);
+  const nextSectionMatch =
+    /^\s*\[{1,2}[A-Za-z0-9_-][^\[\]\r\n]*\]{1,2}\s*(?:#.*)?$/m.exec(afterHeader);
   const sectionBody = nextSectionMatch
     ? afterHeader.slice(0, nextSectionMatch.index)
     : afterHeader;
@@ -987,6 +994,9 @@ export default function (pi: ExtensionAPI) {
                 text: `\n[rust-guardian hint: '${rawPath}' was reformatted by rustfmt after it was last read, which may have wrapped or re-indented lines. Call 'read' on the target section to inspect current formatting before retrying 'edit'.]`,
               },
             ],
+            ...((event as any).structuredContent !== undefined
+              ? { structuredContent: (event as any).structuredContent }
+              : {}),
           };
         }
       }
@@ -1146,7 +1156,9 @@ export default function (pi: ExtensionAPI) {
 
     const boxFooter = result.ok
       ? `cargo check --all-targets: 0 errors (${durationLabel})`
-      : formatErrorReport(result.errors).trimStart();
+      : formatErrorReport(result.errors)
+          .trimStart()
+          .replace(/^\[([^\]]+)\]:/, "$1:");
 
     const finalDetails =
       event.toolName === "edit"
@@ -1155,6 +1167,9 @@ export default function (pi: ExtensionAPI) {
 
     return {
       content: [...event.content, { type: "text", text: statusText }],
+      ...((event as any).structuredContent !== undefined
+        ? { structuredContent: (event as any).structuredContent }
+        : {}),
       ...(finalDetails ? { details: finalDetails } : {}),
     };
   });

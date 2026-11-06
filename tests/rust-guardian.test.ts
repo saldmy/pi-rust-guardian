@@ -343,6 +343,52 @@ describe("detectRustEdition section-aware parsing", () => {
     assert.equal(parseSectionEdition(toml, "workspace.package"), "2024");
   });
 
+  it("parses edition when array brackets start on a newline", () => {
+    const toml = [
+      "[package]",
+      'name = "multiline-array"',
+      "authors =",
+      "[",
+      '  "Alice <alice@example.com>",',
+      "]",
+      'edition = "2024"',
+    ].join("\n");
+
+    assert.equal(parseSectionEdition(toml, "package"), "2024");
+  });
+
+  it("parses edition when indented array elements appear on their own line", () => {
+    const toml = [
+      "[package]",
+      'name = "nested-elements"',
+      "keywords = [",
+      '  ["nested"],',
+      "]",
+      'edition = "2021"',
+    ].join("\n");
+
+    assert.equal(parseSectionEdition(toml, "package"), "2021");
+  });
+
+  it("stops section parsing at target cfg and complex section headers", () => {
+    const toml = [
+      "[package]",
+      'name = "target-cfg-test"',
+      "",
+      "[target.'cfg(unix)'.dependencies]",
+      'edition = "2024"',
+      "",
+      '[target.\'cfg(target_os = "linux")\'.dependencies]',
+      'edition = "2021"',
+    ].join("\n");
+
+    assert.equal(parseSectionEdition(toml, "package"), null);
+    assert.equal(
+      parseSectionEdition(toml, "target.'cfg(unix)'.dependencies"),
+      "2024"
+    );
+  });
+
   it("prefers [workspace.package] edition over [package] edition in mixed root manifests", () => {
     const rootDir = mkdtempSync(join(tmpdir(), "rg-mixed-"));
     const memberDir = join(rootDir, "crates", "member");
@@ -563,6 +609,283 @@ describe("syncFromBranch replay preserves formattedSinceRead and guardianDetails
       assert.equal(snap!.hash, h3);
       assert.equal(snap!.full, true);
       assert.equal(snap!.formattedSinceRead, true);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("diff box footer formatting", () => {
+  it("formats error header without outer brackets for clean TUI diff display", () => {
+    const errors = ["error[E0308]: mismatched types\n  --> src/main.rs:2:5"];
+    const formatted = formatErrorReport(errors);
+    const boxFooter = formatted
+      .trimStart()
+      .replace(/^\[([^\]]+)\]:/, "$1:");
+
+    assert.ok(
+      boxFooter.startsWith(
+        "cargo check --all-targets: 1 error(s) — fix before finishing:"
+      )
+    );
+    assert.ok(!boxFooter.startsWith("[cargo check"));
+  });
+});
+
+describe("narrow terminal footer path allocation", () => {
+  it("allocates room for status on line 1 when baseLine fills width but width >= 40", () => {
+    const width = 60;
+    const line0 =
+      "~/Code/rust/pi-rust-guardian/crates/member (main) • session-foo";
+    const rgText = "rust-guardian: ready (5 .rs tracked)";
+    const cleanRg = rgText.replace(/[\r\n\t]+/g, " ").trim();
+    const sep = "  •  ";
+
+    let baseLine = line0;
+    let available = width - visibleWidth(baseLine) - visibleWidth(sep);
+    if (available <= 10 && width >= 40) {
+      const maxBaseWidth = Math.max(15, Math.floor(width * 0.55));
+      baseLine = truncateToWidth(baseLine, maxBaseWidth);
+      available = width - visibleWidth(baseLine) - visibleWidth(sep);
+    }
+
+    assert.ok(available > 10);
+    const combined = truncateToWidth(
+      `${baseLine}${sep}${truncateToWidth(cleanRg, available)}`,
+      width
+    );
+    assert.ok(visibleWidth(combined) <= width);
+    assert.ok(combined.includes("rust-guardian"));
+  });
+});
+
+describe("tool_call Read-Guard hook integration", () => {
+  it("blocks unread existing .rs files and partial write, but allows edit on partial and write on new/full", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rg-hook-test-"));
+    try {
+      mkdirSync(join(tempDir, "src"));
+      writeFileSync(join(tempDir, "src", "lib.rs"), "pub fn test() {}\n");
+
+      const handlers: Record<string, ((...args: any[]) => any)[]> = {};
+      const mockPi = {
+        registerCommand: () => {},
+        on: (name: string, cb: (...args: any[]) => any) => {
+          handlers[name] = handlers[name] || [];
+          handlers[name].push(cb);
+        },
+        appendEntry: () => {},
+      } as any;
+      rustGuardian(mockPi);
+
+      const sessionId = `hook-session-${Date.now()}`;
+      const ctx = {
+        cwd: tempDir,
+        hasUI: false,
+        sessionManager: { getSessionId: () => sessionId },
+        ui: { notify: () => {} },
+      } as any;
+
+      // 1. Tool call on unread existing file -> blocked for edit & write
+      const blockEdit = await handlers.tool_call[0](
+        { toolName: "edit", input: { path: "src/lib.rs" } },
+        ctx
+      );
+      assert.ok(blockEdit?.block);
+      assert.match(blockEdit.reason, /already exists/);
+
+      const blockWrite = await handlers.tool_call[0](
+        { toolName: "write", input: { path: "src/lib.rs" } },
+        ctx
+      );
+      assert.ok(blockWrite?.block);
+      assert.match(blockWrite.reason, /already exists/);
+
+      // 2. Tool call write on non-existent file -> allowed
+      const allowNewWrite = await handlers.tool_call[0](
+        { toolName: "write", input: { path: "src/new_file.rs" } },
+        ctx
+      );
+      assert.equal(allowNewWrite, undefined);
+
+      // 3. Tool result read with partial coverage (offset > 1)
+      const readPartialRes = await handlers.tool_result[0](
+        {
+          toolName: "read",
+          input: { path: "src/lib.rs", offset: 2 },
+          isError: false,
+          content: [{ type: "text", text: "..." }],
+        },
+        ctx
+      );
+      assert.ok(readPartialRes?.details);
+      assert.equal(readPartialRes.details.rustGuardian.full, false);
+
+      // 4. Targeted edit allowed on partial coverage
+      const allowPartialEdit = await handlers.tool_call[0](
+        { toolName: "edit", input: { path: "src/lib.rs" } },
+        ctx
+      );
+      assert.equal(allowPartialEdit, undefined);
+
+      // 5. Whole-file write blocked on partial coverage
+      const blockPartialWrite = await handlers.tool_call[0](
+        { toolName: "write", input: { path: "src/lib.rs" } },
+        ctx
+      );
+      assert.ok(blockPartialWrite?.block);
+      assert.match(blockPartialWrite.reason, /partially read/);
+
+      // 6. Tool result read with full coverage
+      await handlers.tool_result[0](
+        {
+          toolName: "read",
+          input: { path: "src/lib.rs" },
+          isError: false,
+          content: [{ type: "text", text: "pub fn test() {}\n" }],
+        },
+        ctx
+      );
+
+      // 7. Write allowed on full coverage
+      const allowFullWrite = await handlers.tool_call[0](
+        { toolName: "write", input: { path: "src/lib.rs" } },
+        ctx
+      );
+      assert.equal(allowFullWrite, undefined);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("tool_result structuredContent forwarding", () => {
+  it("preserves structuredContent on reformatted edit error hint", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rg-sc-test-"));
+    try {
+      mkdirSync(join(tempDir, "src"));
+      writeFileSync(join(tempDir, "src", "lib.rs"), "pub fn test() {}\n");
+
+      const handlers: Record<string, ((...args: any[]) => any)[]> = {};
+      const mockPi = {
+        registerCommand: () => {},
+        on: (name: string, cb: (...args: any[]) => any) => {
+          handlers[name] = handlers[name] || [];
+          handlers[name].push(cb);
+        },
+        appendEntry: () => {},
+      } as any;
+      rustGuardian(mockPi);
+
+      const sessionId = `sc-session-${Date.now()}`;
+      const ctx = {
+        cwd: tempDir,
+        hasUI: false,
+        sessionManager: { getSessionId: () => sessionId },
+        ui: { notify: () => {} },
+      } as any;
+
+      // Full read first
+      await handlers.tool_result[0](
+        {
+          toolName: "read",
+          input: { path: "src/lib.rs" },
+          isError: false,
+          content: [{ type: "text", text: "pub fn test() {}\n" }],
+        },
+        ctx
+      );
+
+      // Simulate post-formatting state
+      const session = getSessionState(getRuntimeState(), ctx);
+      const snap = session.readSnapshots.get(
+        normalizePath(tempDir, "src/lib.rs")
+      );
+      assert.ok(snap);
+      snap!.formattedSinceRead = true;
+
+      // Failed edit with structuredContent
+      const hintRes = await handlers.tool_result[0](
+        {
+          toolName: "edit",
+          input: { path: "src/lib.rs" },
+          isError: true,
+          content: [{ type: "text", text: "replacement failed" }],
+          structuredContent: { customPayload: 42 },
+        },
+        ctx
+      );
+
+      assert.ok(hintRes);
+      assert.deepEqual(hintRes.structuredContent, { customPayload: 42 });
+      assert.match(hintRes.content[1].text, /reformatted by rustfmt/);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("agent_end rustfmt hook integration", () => {
+  it("formats edited files, advances snapshots with formattedSinceRead: true, and appends custom DAG entry", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rg-end-test-"));
+    try {
+      mkdirSync(join(tempDir, "src"));
+      writeFileSync(
+        join(tempDir, "Cargo.toml"),
+        '[package]\nname = "foo"\nversion = "0.1.0"\nedition = "2021"\n'
+      );
+      const unformatted = "pub   fn   foo ( ) ->u32{ 1 }\n";
+      const filePath = join(tempDir, "src", "lib.rs");
+      writeFileSync(filePath, unformatted);
+
+      const customEntries: Array<{ type: string; data: any }> = [];
+      const handlers: Record<string, ((...args: any[]) => any)[]> = {};
+      const mockPi = {
+        registerCommand: () => {},
+        on: (name: string, cb: (...args: any[]) => any) => {
+          handlers[name] = handlers[name] || [];
+          handlers[name].push(cb);
+        },
+        appendEntry: (type: string, data: any) => {
+          customEntries.push({ type, data });
+        },
+      } as any;
+      rustGuardian(mockPi);
+
+      const sessionId = `end-session-${Date.now()}`;
+      const ctx = {
+        cwd: tempDir,
+        hasUI: false,
+        sessionManager: { getSessionId: () => sessionId },
+        ui: { notify: () => {} },
+      } as any;
+
+      // Full read
+      await handlers.tool_result[0](
+        {
+          toolName: "read",
+          input: { path: "src/lib.rs" },
+          isError: false,
+          content: [{ type: "text", text: unformatted }],
+        },
+        ctx
+      );
+
+      // Register file edited this turn
+      const session = getSessionState(getRuntimeState(), ctx);
+      session.editedThisTurn.add(normalizePath(tempDir, "src/lib.rs"));
+
+      // Trigger agent_end
+      await handlers.agent_end[0]({}, ctx);
+
+      const snap = session.readSnapshots.get(
+        normalizePath(tempDir, "src/lib.rs")
+      );
+      assert.ok(snap);
+      assert.equal(snap!.formattedSinceRead, true);
+      assert.equal(customEntries.length, 1);
+      assert.equal(customEntries[0].type, "rust-guardian:fmt");
+      assert.ok(Array.isArray(customEntries[0].data?.mappings));
+      assert.equal(customEntries[0].data.mappings.length, 1);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
